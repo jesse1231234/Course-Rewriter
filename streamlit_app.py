@@ -4,7 +4,7 @@
 # - Uses canvasapi + OpenAI Responses API
 # - Preserves existing <iframe>s (domains unchanged) by freezing/restoring
 # - Allows inline styles safely via nh3 filter_style_properties
-# - DesignTools Mode (Preserve/Enhance/Replace) + simple presets
+# - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals (no presets)
 
 import os
 import json
@@ -158,31 +158,6 @@ SYSTEM_PROMPT = (
     "Follow the policy. Return only HTML, no explanations."
 )
 
-PRESETS = {
-    "Accessibility Boost (Enhance)": (
-        "Improve accessibility while preserving meaning. Start headings at h2. "
-        "Fix tables (th scope). Add aria-labels to unlabeled interactive controls. "
-        "Do not change link URLs. Use alt=\"\" if missing."
-    ),
-    "Theme Refresh (Enhance)": (
-        "Apply the {THEME_NAME} theme. Replace legacy theme classes with theme-{THEME_NAME}. "
-        "Prefer class-based styling; keep necessary inline styles."
-    ),
-    "Migrate DT → Native (Replace)": (
-        "Replace DesignTools accordions and tabs with native HTML. "
-        "Use <details><summary> for accordions and structured <section> with headings for tabs. "
-        "Keep IDs/anchors; update references if changed."
-    ),
-    "Heading Normalize (Preserve)": (
-        "Normalize headings to start at h2; remove empty <p> and extra <br>. "
-        "Do not change DesignTools features."
-    ),
-    "Link Hygiene (Enhance)": (
-        "Convert bare URLs to descriptive links when context is clear; otherwise leave as-is. "
-        "Add rel=\"noopener\" to links with target=\"_blank\"."
-    ),
-}
-
 DT_MODES = ["Preserve", "Enhance", "Replace"]
 
 def openai_rewrite(user_request: str, html: str, dt_mode: str) -> str:
@@ -232,13 +207,17 @@ def apply_update(course, item, new_html: str):
 st.title("Canvas Course-wide HTML Rewrite (Test Instance)")
 
 with st.sidebar:
-    st.header("Configuration")
+    st.header("Rewrite Configuration")
     dt_mode = st.selectbox("DesignTools Mode", DT_MODES, index=1)
-    preset_name = st.selectbox("Preset", list(PRESETS.keys()))
-    preset_vars = {}
-    if "Theme Refresh" in preset_name:
-        preset_vars["THEME_NAME"] = st.text_input("Theme name", value="institution")
-    user_request = PRESETS[preset_name].format(**preset_vars) if preset_vars else PRESETS[preset_name]
+    user_request = st.text_area(
+        "Rewrite goals (your instructions)",
+        value="Normalize headings to start at h2; improve accessibility; preserve link destinations; "
+              "convert legacy DT markup as needed; keep existing iframes unchanged.",
+        height=160,
+        help="Describe exactly what to change across the course. Examples: "
+             "normalize headings; apply theme classes; convert accordions to <details>; "
+             "add aria-labels; fix tables; remove empty paragraphs."
+    )
     st.caption("Effective rewrite goals:")
     st.code(user_request)
 
@@ -258,44 +237,47 @@ if courses:
     course = courses[idx]
 
     st.subheader("2) Dry-run")
-    if st.button("Collect items & simulate rewrite"):
-        st.session_state["items"] = []
-        st.session_state["drafts"] = {}
-        with st.spinner("Fetching items…"):
-            module_items = list_supported_items(course)
+    if st.button("Collect items & simulate rewrite", disabled=(not user_request.strip())):
+        if not user_request.strip():
+            st.warning("Please enter rewrite goals first.")
+        else:
+            st.session_state["items"] = []
+            st.session_state["drafts"] = {}
+            with st.spinner("Fetching items…"):
+                module_items = list_supported_items(course)
 
-        progress = st.progress(0.0)
-        total = max(len(module_items), 1)
-        for n, (module, it) in enumerate(module_items, start=1):
-            meta = fetch_item_html(course, it)
-            original = meta["html"] or ""
-            frozen, mapping, hosts = protect_iframes(original)
+            progress = st.progress(0.0)
+            total = max(len(module_items), 1)
+            for n, (module, it) in enumerate(module_items, start=1):
+                meta = fetch_item_html(course, it)
+                original = meta["html"] or ""
+                frozen, mapping, hosts = protect_iframes(original)
 
-            # Call OpenAI
-            rewritten = openai_rewrite(user_request, frozen, dt_mode)
+                # Call OpenAI
+                rewritten = openai_rewrite(user_request, frozen, dt_mode)
 
-            # Remove any new iframes the model tried to add, then restore originals
-            rewritten_no_new_iframes = strip_new_iframes(rewritten)
-            restored = restore_iframes(rewritten_no_new_iframes, mapping)
+                # Remove any new iframes the model tried to add, then restore originals
+                rewritten_no_new_iframes = strip_new_iframes(rewritten)
+                restored = restore_iframes(rewritten_no_new_iframes, mapping)
 
-            # Sanitize final HTML (allow inline styles via property allowlist)
-            sanitized = sanitize_html(restored)
+                # Sanitize final HTML (allow inline styles via property allowlist)
+                sanitized = sanitize_html(restored)
 
-            diff_html = html_diff(original, sanitized)
-            key = f"{meta['kind']}:{meta['id']}"
-            st.session_state["items"].append({
-                "key": key,
-                "title": meta.get("title") or meta.get("url"),
-                "kind": meta["kind"],
-                "module": getattr(module, "name", ""),
-                "item": it,
-                "original": original,
-                "draft": sanitized,
-                "approved": False,
-            })
-            st.session_state["drafts"][key] = {"diff": diff_html}
-            progress.progress(n / total)
-        st.success(f"Prepared {len(st.session_state['items'])} items.")
+                diff_html = html_diff(original, sanitized)
+                key = f"{meta['kind']}:{meta['id']}"
+                st.session_state["items"].append({
+                    "key": key,
+                    "title": meta.get("title") or meta.get("url"),
+                    "kind": meta["kind"],
+                    "module": getattr(module, "name", ""),
+                    "item": it,
+                    "original": original,
+                    "draft": sanitized,
+                    "approved": False,
+                })
+                st.session_state["drafts"][key] = {"diff": diff_html}
+                progress.progress(n / total)
+            st.success(f"Prepared {len(st.session_state['items'])} items.")
 
     items = st.session_state.get("items", [])
     if items:
