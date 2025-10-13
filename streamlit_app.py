@@ -67,7 +67,7 @@ def fetch_item_html(course, item):
 # Iframe freeze/restore so domains remain unchanged
 
 def protect_iframes(html: str):
-    soup = BeautifulSoup(html or '', 'lxml')
+    soup = BeautifulSoup(html or '', 'html.parser')
     mapping, hosts = {}, set()
     i = 1
     for tag in soup.find_all('iframe'):
@@ -90,6 +90,7 @@ SYSTEM_PROMPT = (
     "You are an expert Canvas HTML editor. Preserve links, anchors/IDs, classes, data-* attributes. "
     "Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add or remove them, although they can be repositioned within the page. "
     "Follow the policy. Return only HTML, no explanations."
+    "Reformat the HTML using DesignPLUS styling. Do not change the content of the page, only the design. Apply Headings and accordions where appropriate. Use Colorado State University branding colors. Apply consistent DesignPLUS structure with a header, content blocks, headings, lists, callouts for notes or reminders, and accessible image formatting. The focus is on styling, structure, and accessibility — not changing the content."
 )
 
 PRESETS = {
