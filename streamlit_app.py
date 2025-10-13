@@ -4,12 +4,15 @@
 # - Uses canvasapi + OpenAI Responses API
 # - Preserves existing <iframe>s (domains unchanged) by freezing/restoring
 # - Allows inline styles safely via nh3 filter_style_properties
-# - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals (no presets)
+# - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals
+# - NEW: Optional "Model Reference" (HTML skeleton or image) included in the prompt
 
 import os
 import json
+import base64
 import hashlib
 import urllib.parse
+from typing import Optional, Tuple
 
 import streamlit as st
 from canvasapi import Canvas
@@ -52,7 +55,6 @@ ATTRIBUTES = {
     "td": ["colspan", "rowspan"],
 }
 
-# Conservative but useful set of CSS properties for inline styles
 ALLOWED_CSS_PROPERTIES = {
     # layout
     "display", "visibility", "float", "clear", "overflow", "overflow-x", "overflow-y",
@@ -71,7 +73,7 @@ ALLOWED_CSS_PROPERTIES = {
     "color", "font", "font-family", "font-size", "font-weight", "font-style",
     "font-variant", "line-height", "letter-spacing", "text-align",
     "text-decoration", "text-transform", "white-space", "word-break",
-    # flex & grid (common for themes)
+    # flex & grid
     "flex", "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
     "justify-content", "align-items", "align-content", "gap", "row-gap", "column-gap",
     "grid", "grid-template", "grid-template-columns", "grid-template-rows", "grid-column", "grid-row",
@@ -86,7 +88,7 @@ def sanitize_html(html: str) -> str:
         tags=set(ALLOWED_TAGS),
         attributes={k: set(v) for k, v in ATTRIBUTES.items()},
         filter_style_properties=set(ALLOWED_CSS_PROPERTIES),
-        link_rel=None,  # don't force rel=... unless you want to enforce noopener here
+        link_rel=None,
     )
 
 # ---------------------- Helpers ----------------------
@@ -104,7 +106,6 @@ def list_supported_items(course):
     """Enumerate Module Items and keep only Pages and Assignments."""
     supported = []
     for module in course.get_modules(include_items=True):
-        # Some Canvas instances may not populate 'items' without an explicit call:
         items = list(module.get_module_items()) if not getattr(module, "items", None) else module.items
         for it in items:
             if it.type in {"Page", "Assignment"}:
@@ -152,6 +153,59 @@ def strip_new_iframes(html: str) -> str:
         tag.decompose()
     return str(soup)
 
+# ---- NEW: Model reference helpers ----
+
+def html_to_skeleton(model_html: str, max_nodes: int = 1200) -> str:
+    """
+    Collapse a model HTML into a compact 'skeleton':
+    - keep tags + ids/classes + data-*
+    - drop most text and src/href values (avoid leaking course-specific links)
+    - keep headings' text (shortened) to preserve hierarchy hints
+    """
+    soup = BeautifulSoup(model_html or "", "html.parser")
+
+    # remove scripts/styles entirely
+    for bad in soup(["script", "style"]):
+        bad.decompose()
+
+    count = 0
+    for el in soup.find_all(True):
+        count += 1
+        if count > max_nodes:
+            # Truncate remaining subtree to avoid huge prompts
+            el.decompose()
+            continue
+
+        # keep only id/class/data-* attrs; drop src/href to avoid course leak
+        attrs = dict(el.attrs)
+        new_attrs = {}
+        for k, v in attrs.items():
+            if k in ("id", "class") or k.startswith("data-") or k.startswith("aria-") or k == "role":
+                new_attrs[k] = v
+        el.attrs = new_attrs
+
+        # remove inner text except short headings/labels
+        if el.name not in ("h1","h2","h3","h4","h5","h6","summary","label"):
+            el.string = None
+
+    # Minify-ish output
+    text = " ".join(str(soup).split())
+    # Minor safety: limit size
+    if len(text) > 120_000:
+        text = text[:120_000] + " <!-- truncated -->"
+    return text
+
+def image_to_data_url(file) -> Tuple[str, str]:
+    """
+    Accept a Streamlit UploadedFile and return (data_url, mime).
+    Supports png/jpg/jpeg/webp.
+    """
+    mime = file.type or "image/png"
+    raw = file.read()
+    b64 = base64.b64encode(raw).decode("utf-8")
+    data_url = f"data:{mime};base64,{b64}"
+    return data_url, mime
+
 SYSTEM_PROMPT = (
     "You are an expert Canvas HTML editor. Preserve links, anchors/IDs, classes, and data-* attributes. "
     "Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add, remove, or reorder them. "
@@ -160,30 +214,83 @@ SYSTEM_PROMPT = (
 
 DT_MODES = ["Preserve", "Enhance", "Replace"]
 
-def openai_rewrite(user_request: str, html: str, dt_mode: str) -> str:
-    """Call OpenAI Responses API to rewrite the HTML according to request & policy."""
+def openai_rewrite(
+    user_request: str,
+    html: str,
+    dt_mode: str,
+    model_html_skeleton: Optional[str] = None,
+    model_image_data_url: Optional[str] = None,
+) -> str:
+    """
+    Call OpenAI Responses API to rewrite the HTML.
+    If model_image_data_url is present, send a multimodal input with an image.
+    If model_html_skeleton is present, include it as a reference text block.
+    """
     policy = {
         "design_tools_mode": dt_mode,
         "allow_inline_styles": True,
         "block_new_iframes": True,
+        "reference_model": ("image" if model_image_data_url else "html" if model_html_skeleton else "none"),
+        "reference_usage": "Match layout/sectioning/components; do not copy literal course-specific links or text."
     }
 
-    prompt = "\n\n".join([
+    # Build user content blocks (multimodal if image supplied)
+    text_blocks = [
         "Policy: " + json.dumps(policy, ensure_ascii=False),
         f"DesignTools Mode: {dt_mode}",
         "Rewrite goals: " + user_request,
         "HTML to rewrite follows:",
         html,
-    ])
+    ]
 
-    resp = openai_client.responses.create(
-        model="gpt-4.1",
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
+    if model_html_skeleton:
+        text_blocks.insert(3, "Model HTML skeleton (follow structure/classes, not text):\n" + model_html_skeleton)
+
+    # If no image: send simple text input as before
+    if not model_image_data_url:
+        prompt = "\n\n".join(text_blocks)
+        resp = openai_client.responses.create(
+            model="gpt-4.1",
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+    else:
+        # Multimodal input: text + image (data URL). If this fails, we fall back to text-only.
+        try:
+            # Build content list: an input_text, optional model HTML text, another input_text with the target HTML, and the image
+            content_parts = []
+            # Combine main textual instructions into one block to reduce tokens
+            content_parts.append({"type": "input_text", "text": "\n\n".join(text_blocks[:3])})
+            if model_html_skeleton:
+                content_parts.append({"type": "input_text", "text": text_blocks[3]})
+            # Provide the image as a vision reference
+            content_parts.append({"type": "input_image", "image_url": {"url": model_image_data_url}})
+            # Provide the target HTML to rewrite
+            content_parts.append({"type": "input_text", "text": "\n".join(text_blocks[-2:])})
+
+            resp = openai_client.responses.create(
+                model="gpt-4o",  # vision-capable; switch to a vision model available to your org
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": content_parts},
+                ],
+                temperature=0.2,
+            )
+        except Exception as e:
+            # Fallback: ignore the image and proceed with text only
+            prompt = "\n\n".join(text_blocks) + "\n\n(Note: image reference unavailable; proceed using textual model description if any.)"
+            resp = openai_client.responses.create(
+                model="gpt-4.1",
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+
     # Robust extraction across SDK variants
     try:
         return resp.output_text  # newer SDKs
@@ -212,14 +319,38 @@ with st.sidebar:
     user_request = st.text_area(
         "Rewrite goals (your instructions)",
         value="Normalize headings to start at h2; improve accessibility; preserve link destinations; "
-              "convert legacy DT markup as needed; keep existing iframes unchanged.",
+              "convert or enhance DesignTools components as needed; keep existing iframes unchanged.",
         height=160,
-        help="Describe exactly what to change across the course. Examples: "
-             "normalize headings; apply theme classes; convert accordions to <details>; "
-             "add aria-labels; fix tables; remove empty paragraphs."
+        help="Describe exactly what to change across the course."
     )
-    st.caption("Effective rewrite goals:")
-    st.code(user_request)
+
+    st.markdown("---")
+    st.subheader("Model Reference (optional)")
+    ref_kind = st.radio("Type", ["None", "Upload HTML", "Upload Image"], horizontal=True)
+
+    model_html_skeleton = None
+    model_image_data_url = None
+
+    if ref_kind == "Upload HTML":
+        uploaded_html = st.file_uploader("Upload model page HTML", type=["html", "htm"], accept_multiple_files=False)
+        if uploaded_html is not None:
+            try:
+                raw = uploaded_html.read().decode("utf-8", errors="ignore")
+                model_html_skeleton = html_to_skeleton(raw)
+                with st.expander("Preview model HTML skeleton"):
+                    st.code(model_html_skeleton[:4000])
+            except Exception as e:
+                st.error(f"Failed to parse model HTML: {e}")
+
+    elif ref_kind == "Upload Image":
+        uploaded_img = st.file_uploader("Upload model page image", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=False)
+        if uploaded_img is not None:
+            try:
+                model_image_data_url, mime = image_to_data_url(uploaded_img)
+                st.image(uploaded_img, caption=f"Model reference ({mime})", use_column_width=True)
+                st.caption("The image will be passed to the model as a vision reference. If unsupported, we will fall back to text-only.")
+            except Exception as e:
+                st.error(f"Failed to process image: {e}")
 
 st.subheader("1) Pick Course by Code")
 course_code = st.text_input("Course code", help="Exact course code preferred; we'll disambiguate if needed.")
@@ -253,8 +384,14 @@ if courses:
                 original = meta["html"] or ""
                 frozen, mapping, hosts = protect_iframes(original)
 
-                # Call OpenAI
-                rewritten = openai_rewrite(user_request, frozen, dt_mode)
+                # Call OpenAI with optional model reference
+                rewritten = openai_rewrite(
+                    user_request=user_request,
+                    html=frozen,
+                    dt_mode=dt_mode,
+                    model_html_skeleton=model_html_skeleton,
+                    model_image_data_url=model_image_data_url,
+                )
 
                 # Remove any new iframes the model tried to add, then restore originals
                 rewritten_no_new_iframes = strip_new_iframes(rewritten)
