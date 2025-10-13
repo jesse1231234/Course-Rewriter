@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from diff_match_patch import diff_match_patch
 import nh3
 from nh3 import CssSanitizer
+import json
 
 # ---------------------- Config & Clients ----------------------
 SECRETS = st.secrets if hasattr(st, 'secrets') else os.environ
@@ -124,16 +125,17 @@ def openai_rewrite(user_request: str, html: str, dt_mode: str) -> str:
     policy = {
         "design_tools_mode": dt_mode,
         "allow_inline_styles": True,
-        "block_new_iframes": True
+        "block_new_iframes": True,
     }
-    prompt = f"Policy: {policy}
 
-DesignTools Mode: {dt_mode}
+    prompt = "\n\n".join([
+        "Policy: " + json.dumps(policy, ensure_ascii=False),
+        f"DesignTools Mode: {dt_mode}",
+        "Rewrite goals: " + user_request,
+        "HTML to rewrite follows:",
+        html,
+    ])
 
-Rewrite goals: {user_request}
-
-HTML to rewrite follows:
-{html}"
     resp = openai_client.responses.create(
         model="gpt-4.1",
         input=[
@@ -142,11 +144,10 @@ HTML to rewrite follows:
         ],
         temperature=0.2,
     )
-    # Robust extraction across SDK variants
     try:
-        return resp.output_text
+        return resp.output_text  # newer SDKs
     except AttributeError:
-        return resp.output[0].content[0].text
+        return resp.output[0].content[0].text  # fallback for older SDKs
 
 # Diff
 
