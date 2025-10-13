@@ -1,0 +1,7 @@
+streamlit
+canvasapi
+openai
+nh3
+beautifulsoup4
+lxml
+python-diff-match-patch
