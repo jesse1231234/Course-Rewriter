@@ -159,18 +159,52 @@ def strip_new_iframes(html: str) -> str:
 
 def read_text_upload(uploaded_file) -> str:
     """
-    Return uploaded text file as str. Uses getvalue() to avoid pointer issues.
-    Tries utf-8, falls back to latin-1 (lossy) so we never crash.
+    Robustly read an uploaded text file as str.
+    Prefers getbuffer() → bytes(); falls back to getvalue()/read().
+    Decodes as UTF-8 with latin-1 fallback.
     """
     if uploaded_file is None:
         raise ValueError("No file provided")
-    data = uploaded_file.getvalue()  # bytes (safe across reruns)
+
+    data = None
+
+    # Prefer a zero-copy buffer → bytes
+    try:
+        data = bytes(uploaded_file.getbuffer())
+    except Exception:
+        data = None
+
+    # Fallback: getvalue()
+    if not data:
+        try:
+            val = uploaded_file.getvalue()
+            if isinstance(val, memoryview):
+                data = val.tobytes()
+            else:
+                data = val  # may already be bytes or None
+        except Exception:
+            data = None
+
+    # Fallback: seek + read
+    if not data:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        try:
+            data = uploaded_file.read()
+        except Exception:
+            data = None
+
     if not data:
         raise ValueError("Empty file or no bytes read")
+
+    # Decode with fallback
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError:
+    except Exception:
         return data.decode("latin-1", errors="ignore")
+
 
 def image_to_data_url(file) -> Tuple[str, str]:
     """
