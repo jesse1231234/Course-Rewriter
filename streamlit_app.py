@@ -18,7 +18,7 @@ from typing import Optional, Tuple, List
 import streamlit as st
 from canvasapi import Canvas
 from openai import OpenAI
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from diff_match_patch import diff_match_patch
 import nh3
 
@@ -157,38 +157,81 @@ def strip_new_iframes(html: str) -> str:
 
 # ---- Model reference helpers ----
 
-def html_to_skeleton(model_html: str, max_nodes: int = 1200) -> str:
+def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80) -> str:
     """
-    Collapse a model HTML into a compact 'skeleton':
-    - keep tags + ids/classes + data-*
-    - drop most text and src/href values (avoid leaking course-specific links)
-    - keep headings' text (shortened) to preserve hierarchy hints
+    Build a compact, valid-ish skeleton of the model HTML:
+    - Preserves tag hierarchy
+    - Keeps only id/class/role/aria-/data-* attributes
+    - Keeps short text only for headings/labels/summary
+    - Never mutates the parsed DOM (avoids bs4 edge cases)
     """
     soup = BeautifulSoup(model_html or "", "html.parser")
 
-    # remove scripts/styles entirely
-    for bad in soup(["script", "style"]):
-        bad.decompose()
+    def keep_attr(k: str) -> bool:
+        return k in ("id", "class", "role") or k.startswith("aria-") or k.startswith("data-")
 
-    count = 0
-    for el in soup.find_all(True):
-        count += 1
-        if count > max_nodes:
-            el.decompose()
-            continue
+    def fmt_attrs(attrs: dict) -> str:
+        parts = []
+        for k, v in (attrs or {}).items():
+            if not keep_attr(k):
+                continue
+            if isinstance(v, (list, tuple)):
+                v = " ".join(map(str, v))
+            v = " ".join(str(v).split())[:120]  # compact + limit
+            parts.append(f'{k}="{v}"')
+        return (" " + " ".join(parts)) if parts else ""
 
-        attrs = dict(el.attrs)
-        new_attrs = {}
-        for k, v in attrs.items():
-            if k in ("id", "class") or k.startswith("data-") or k.startswith("aria-") or k == "role":
-                new_attrs[k] = v
-        el.attrs = new_attrs
+    headings = {"h1","h2","h3","h4","h5","h6","summary","label"}
 
-        # remove inner text except short headings/labels
-        if el.name not in ("h1","h2","h3","h4","h5","h6","summary","label"):
-            el.string = None
+    count = [0]  # mutable counter in closure
 
-    text = " ".join(str(soup).split())
+    def render(node) -> str:
+        if count[0] >= max_nodes:
+            return ""
+        if isinstance(node, NavigableString):
+            # We only keep text when the *parent* is a heading-like tag; handled in parent.
+            return ""
+
+        if not isinstance(node, Tag):
+            return ""
+
+        count[0] += 1
+        start = f"<{node.name}{fmt_attrs(node.attrs)}>"
+        inner = []
+
+        # Keep a small amount of direct text for headings/labels/summaries
+        if node.name in headings:
+            direct_text = []
+            for child in node.children:
+                if isinstance(child, NavigableString):
+                    direct_text.append(str(child))
+            text = " ".join(" ".join(direct_text).split())
+            if text:
+                inner.append(text[:max_text])
+
+        # Recurse into child tags
+        for child in node.children:
+            if isinstance(child, Tag):
+                piece = render(child)
+                if piece:
+                    inner.append(piece)
+            if count[0] >= max_nodes:
+                break
+
+        end = f"</{node.name}>"
+        return start + "".join(inner) + end
+
+    roots = list(soup.body.children) if soup.body else list(soup.children)
+    out = []
+    for child in roots:
+        piece = render(child)
+        if piece:
+            out.append(piece)
+        if count[0] >= max_nodes:
+            break
+
+    text = "".join(out)
+    text = " ".join(text.split())
     if len(text) > 120_000:
         text = text[:120_000] + " <!-- truncated -->"
     return text
@@ -253,6 +296,12 @@ SYSTEM_PROMPT = (
     "You are an expert Canvas HTML editor. Preserve links, anchors/IDs, classes, and data-* attributes. "
     "Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add, remove, or reorder them. "
     "Follow the policy. Return only HTML, no explanations."
+    "Reformat the HTML using DesignPLUS styling."
+    "Do not change the content of the page, only the design."
+    "Use Colorado State University branding colors."
+    "Use Circle Left 1 theme only"
+    "put all iframes within accordions"
+    "The focus is on styling, structure, and accessibility — not changing the content."
 )
 
 DT_MODES = ["Preserve", "Enhance", "Replace"]
@@ -376,6 +425,7 @@ with st.sidebar:
         if pasted_html.strip():
             try:
                 model_html_skeleton = html_to_skeleton(pasted_html)
+                st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
                 with st.expander("Preview model HTML skeleton"):
                     st.code(model_html_skeleton[:4000])
             except Exception as e:
@@ -423,6 +473,7 @@ with st.sidebar:
                         try:
                             raw = fetch_model_item_html(model_course, "Page", page_map[sel_title])
                             model_html_skeleton = html_to_skeleton(raw)
+                            st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
                             with st.expander("Preview model HTML skeleton"):
                                 st.code(model_html_skeleton[:4000])
                         except Exception as e:
@@ -441,6 +492,7 @@ with st.sidebar:
                         try:
                             raw = fetch_model_item_html(model_course, "Assignment", asg_map[sel_name])
                             model_html_skeleton = html_to_skeleton(raw)
+                            st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
                             with st.expander("Preview model HTML skeleton"):
                                 st.code(model_html_skeleton[:4000])
                         except Exception as e:
