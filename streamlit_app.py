@@ -302,6 +302,7 @@ SYSTEM_PROMPT = (
     "Use Circle Left 1 theme only"
     "put all iframes within accordions"
     "The focus is on styling, structure, and accessibility — not changing the content."
+    "apply consistent design choices across all pages"
 )
 
 DT_MODES = ["Preserve", "Enhance", "Replace"]
