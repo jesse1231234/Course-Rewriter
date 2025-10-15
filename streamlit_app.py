@@ -5,7 +5,7 @@
 # - Preserves existing <iframe>s (domains unchanged) by freezing/restoring
 # - Allows inline styles safely via nh3 filter_style_properties
 # - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals
-# - Model Reference: Upload HTML (skeletonized), Upload Image (vision), or pick from a Model Course
+# - Model Reference: Paste HTML (skeletonized), Upload Image (vision), or pick from a Model Course
 
 import os
 import re
@@ -155,70 +155,6 @@ def strip_new_iframes(html: str) -> str:
         tag.decompose()
     return str(soup)
 
-# ---- Robust upload readers ----
-
-def read_text_upload(uploaded_file) -> str:
-    """
-    Robustly read an uploaded text file as str.
-    Prefers getbuffer() → bytes(); falls back to getvalue()/read().
-    Decodes as UTF-8 with latin-1 fallback.
-    """
-    if uploaded_file is None:
-        raise ValueError("No file provided")
-
-    data = None
-
-    # Prefer a zero-copy buffer → bytes
-    try:
-        data = bytes(uploaded_file.getbuffer())
-    except Exception:
-        data = None
-
-    # Fallback: getvalue()
-    if not data:
-        try:
-            val = uploaded_file.getvalue()
-            if isinstance(val, memoryview):
-                data = val.tobytes()
-            else:
-                data = val  # may already be bytes or None
-        except Exception:
-            data = None
-
-    # Fallback: seek + read
-    if not data:
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
-        try:
-            data = uploaded_file.read()
-        except Exception:
-            data = None
-
-    if not data:
-        raise ValueError("Empty file or no bytes read")
-
-    # Decode with fallback
-    try:
-        return data.decode("utf-8")
-    except Exception:
-        return data.decode("latin-1", errors="ignore")
-
-
-def image_to_data_url(file) -> Tuple[str, str]:
-    """
-    Accept a Streamlit UploadedFile and return (data_url, mime).
-    Uses getvalue() instead of read() so we can preview and send to the model without re-upload.
-    """
-    if file is None:
-        raise ValueError("No image provided")
-    mime = file.type or "image/png"
-    raw = file.getvalue()  # bytes
-    b64 = base64.b64encode(raw).decode("utf-8")
-    data_url = f"data:{mime};base64,{b64}"
-    return data_url, mime
-
 # ---- Model reference helpers ----
 
 def html_to_skeleton(model_html: str, max_nodes: int = 1200) -> str:
@@ -285,6 +221,31 @@ def fetch_model_item_html(course, kind: str, ident):
         asg = course.get_assignment(int(ident))  # ident = assignment id
         return asg.description or ""
     return ""
+
+def image_to_data_url(file) -> Tuple[str, str]:
+    """
+    Accept a Streamlit UploadedFile and return (data_url, mime).
+    Uses getbuffer()/bytes() to avoid None issues on reruns.
+    """
+    if file is None:
+        raise ValueError("No image provided")
+    mime = file.type or "image/png"
+    raw = None
+    try:
+        raw = bytes(file.getbuffer())
+    except Exception:
+        pass
+    if not raw:
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        raw = file.read()
+    if not raw:
+        raise ValueError("Empty image or no bytes read")
+    b64 = base64.b64encode(raw).decode("utf-8")
+    data_url = f"data:{mime};base64,{b64}"
+    return data_url, mime
 
 # ---------------------- OpenAI ----------------------
 
@@ -401,28 +362,31 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Model Reference (optional)")
-    ref_kind = st.radio("Type", ["None", "Upload HTML", "Upload Image", "Model Course"], horizontal=True)
+    ref_kind = st.radio("Type", ["None", "Paste HTML", "Upload Image", "Model Course"], horizontal=True)
 
     model_html_skeleton = None
     model_image_data_url = None
 
-    if ref_kind == "Upload HTML":
-        uploaded_html = st.file_uploader("Upload model page HTML", type=["html", "htm"], accept_multiple_files=False)
-        if uploaded_html is not None:
+    if ref_kind == "Paste HTML":
+        pasted_html = st.text_area(
+            "Paste model HTML here",
+            height=220,
+            help="Paste the HTML of a model Canvas page. We will derive a structure skeleton from it."
+        )
+        if pasted_html.strip():
             try:
-                raw_text = read_text_upload(uploaded_html)  # robust reader
-                model_html_skeleton = html_to_skeleton(raw_text)
+                model_html_skeleton = html_to_skeleton(pasted_html)
                 with st.expander("Preview model HTML skeleton"):
                     st.code(model_html_skeleton[:4000])
             except Exception as e:
-                st.error(f"Failed to parse model HTML: {e}")
+                st.error(f"Failed to process pasted HTML: {e}")
 
     elif ref_kind == "Upload Image":
         uploaded_img = st.file_uploader("Upload model page image", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=False)
         if uploaded_img is not None:
             try:
-                model_image_data_url, mime = image_to_data_url(uploaded_img)  # robust reader
-                st.image(uploaded_img, caption=f"Model reference ({mime})", use_column_width=True)
+                model_image_data_url, mime = image_to_data_url(uploaded_img)
+                st.image(uploaded_img, caption=f"Model reference ({mime})", use_container_width=True)
                 st.caption("The image will be passed to the model as a vision reference. If unsupported, we will fall back to text-only.")
             except Exception as e:
                 st.error(f"Failed to process image: {e}")
