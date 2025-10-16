@@ -2,16 +2,18 @@
 # Canvas Course-wide HTML Rewrite (Test Instance)
 # - Streamlit UI for admin-only dry-run + apply
 # - Uses canvasapi + OpenAI Responses API
-# - Preserves existing <iframe>s (domains unchanged) by freezing/restoring
-# - Allows inline styles safely via nh3 filter_style_properties
+# - Preserves existing <iframe>s by freezing/restoring; strips any new iframes the model adds
 # - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals
 # - Model Reference: Paste HTML (skeletonized), Upload Image (vision), or pick from a Model Course
-# - NEW: Auto-pick the newest available OpenAI models (with manual override)
+# - Auto-pick newest OpenAI models + retries/fallbacks for transient API errors
+# - No sanitizer: writes model output directly back to Canvas
 
 import os
 import re
 import json
 import base64
+import time
+import random
 import hashlib
 import urllib.parse
 from typing import Optional, Tuple, List
@@ -21,7 +23,6 @@ from canvasapi import Canvas
 from openai import OpenAI
 from bs4 import BeautifulSoup, NavigableString, Tag
 from diff_match_patch import diff_match_patch
-import nh3
 
 # ---------------------- Config & Clients ----------------------
 
@@ -33,7 +34,7 @@ CANVAS_ADMIN_TOKEN = SECRETS["CANVAS_ADMIN_TOKEN"]
 OPENAI_API_KEY = SECRETS["OPENAI_API_KEY"]
 
 # Defaults if auto-pick fails or listing isn't permitted
-DEFAULT_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5")   # fallback to 5 → 4.1 below if unavailable
+DEFAULT_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5")    # falls back to 4.1 if unavailable
 DEFAULT_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
 
 st.set_page_config(page_title="Canvas Course-wide HTML Rewrite (Test)", layout="wide")
@@ -213,10 +214,7 @@ def fetch_model_item_html(course, kind: str, ident):
     return ""
 
 def image_to_data_url(file) -> Tuple[str, str]:
-    """
-    Accept a Streamlit UploadedFile and return (data_url, mime).
-    Uses getbuffer()/bytes() to avoid None issues on reruns.
-    """
+    """Accept a Streamlit UploadedFile and return (data_url, mime)."""
     if file is None:
         raise ValueError("No image provided")
     mime = file.type or "image/png"
@@ -263,7 +261,7 @@ def latest_model_id(client: OpenAI, pattern: str, default_id: str) -> str:
     except Exception:
         return default_id
 
-# ---------------------- OpenAI Rewrite ----------------------
+# ---------------------- OpenAI + retries ----------------------
 
 SYSTEM_PROMPT = (
     "You are an expert Canvas HTML editor. Preserve links, anchors/IDs, classes, and data-* attributes. "
@@ -272,6 +270,51 @@ SYSTEM_PROMPT = (
 )
 
 DT_MODES = ["Preserve", "Enhance", "Replace"]
+
+def _create_with_retries(
+    client: OpenAI,
+    model: str,
+    payload_input,
+    fallback_model: Optional[str] = None,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+):
+    """
+    Call Responses API with retries for 5xx/timeout/network errors.
+    If all retries fail, optionally try once with fallback_model (also retried).
+    Returns the response or raises the last exception.
+    """
+    def _do_call(m: str):
+        return client.responses.create(model=m, input=payload_input, temperature=0.2)
+
+    def _should_retry(err: Exception) -> bool:
+        s = str(err).lower()
+        return any(k in s for k in ["server_error", "status code: 5", "timed out", "timeout", "temporarily unavailable"])
+
+    last_err = None
+
+    # try primary
+    for attempt in range(max_retries):
+        try:
+            return _do_call(model)
+        except Exception as e:
+            last_err = e
+            if not _should_retry(e):
+                break
+            time.sleep(base_delay * (2 ** attempt) + random.random() * 0.5)
+
+    # try fallback once (with retries) if provided
+    if fallback_model and fallback_model != model:
+        for attempt in range(max_retries):
+            try:
+                return _do_call(fallback_model)
+            except Exception as e:
+                last_err = e
+                if not _should_retry(e):
+                    break
+                time.sleep(base_delay * (2 ** attempt) + random.random() * 0.5)
+
+    raise last_err
 
 def openai_rewrite(
     user_request: str,
@@ -305,31 +348,20 @@ def openai_rewrite(
     if model_html_skeleton:
         text_blocks.insert(3, "Model HTML skeleton (follow structure/classes, not text):\n" + model_html_skeleton)
 
-    # Helper to detect "model not found" and retry with a fallback once
-    def _create_with_fallback(primary_model: str, payload_input, fallback_model: str):
-        try:
-            return openai_client.responses.create(
-                model=primary_model,
-                input=payload_input,
-                temperature=0.2,
-            )
-        except Exception as e:
-            msg = str(e).lower()
-            if "model" in msg and ("not found" in msg or "does not exist" in msg or "unknown" in msg):
-                return openai_client.responses.create(
-                    model=fallback_model,
-                    input=payload_input,
-                    temperature=0.2,
-                )
-            raise
-
     if not model_image_data_url:
         prompt = "\n\n".join(text_blocks)
         payload = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        resp = _create_with_fallback(primary_model=model_text_id, payload_input=payload, fallback_model="gpt-4.1")
+        resp = _create_with_retries(
+            client=openai_client,
+            model=model_text_id,
+            payload_input=payload,
+            fallback_model="gpt-4.1",
+            max_retries=3,
+            base_delay=1.0,
+        )
     else:
         # Try multimodal; on failure, fall back to text-only with the text model
         try:
@@ -345,14 +377,28 @@ def openai_rewrite(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": content_parts},
             ]
-            resp = _create_with_fallback(primary_model=model_vision_id, payload_input=payload, fallback_model="gpt-4o")
+            resp = _create_with_retries(
+                client=openai_client,
+                model=model_vision_id,
+                payload_input=payload,
+                fallback_model="gpt-4o",
+                max_retries=3,
+                base_delay=1.0,
+            )
         except Exception:
             prompt = "\n\n".join(text_blocks) + "\n\n(Note: image reference unavailable; proceed using textual model description if any.)"
             payload = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ]
-            resp = _create_with_fallback(primary_model=model_text_id, payload_input=payload, fallback_model="gpt-4.1")
+            resp = _create_with_retries(
+                client=openai_client,
+                model=model_text_id,
+                payload_input=payload,
+                fallback_model="gpt-4.1",
+                max_retries=3,
+                base_delay=1.0,
+            )
 
     try:
         return resp.output_text  # newer SDKs
@@ -392,7 +438,7 @@ with st.sidebar:
     st.subheader("Model")
     mode = st.radio("Selection", ["Auto (latest)", "Manual"], horizontal=True)
     if mode == "Auto (latest)":
-        # Prefer newest gpt-5 for text; fallback to gpt-4.1 / gpt-4o
+        # Prefer newest gpt-5 for text; fallback to 4.1/4o as needed
         MODEL_TEXT = latest_model_id(openai_client, r"^(gpt-5|gpt-4\.1|gpt-4o|o\d)", DEFAULT_TEXT_MODEL)
         # Prefer newest gpt-5 or gpt-4o for vision (most orgs have 4o for vision)
         MODEL_VISION = latest_model_id(openai_client, r"^(gpt-5|gpt-4o|gpt-4\.1|o\d)", DEFAULT_VISION_MODEL)
@@ -401,6 +447,16 @@ with st.sidebar:
         MODEL_VISION = st.text_input("Vision model id", value=DEFAULT_VISION_MODEL)
     st.caption(f"Using text model: {MODEL_TEXT}")
     st.caption(f"Using vision model: {MODEL_VISION}")
+
+    with st.expander("Advanced (prompt size & retries)"):
+        MAX_INPUT_CHARS = st.number_input(
+            "Max item HTML chars sent to model",
+            min_value=5000, max_value=200000, value=40000, step=5000
+        )
+        MAX_MODEL_SKELETON_CHARS = st.number_input(
+            "Max model skeleton chars",
+            min_value=5000, max_value=200000, value=60000, step=5000
+        )
 
     st.markdown("---")
     st.subheader("Model Reference (optional)")
@@ -418,6 +474,8 @@ with st.sidebar:
         if pasted_html.strip():
             try:
                 model_html_skeleton = html_to_skeleton(pasted_html)
+                if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
+                    model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
                 st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
                 with st.expander("Preview model HTML skeleton"):
                     st.code(model_html_skeleton[:4000])
@@ -466,6 +524,8 @@ with st.sidebar:
                         try:
                             raw = fetch_model_item_html(model_course, "Page", page_map[sel_title])
                             model_html_skeleton = html_to_skeleton(raw)
+                            if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
+                                model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
                             st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
                             with st.expander("Preview model HTML skeleton"):
                                 st.code(model_html_skeleton[:4000])
@@ -485,6 +545,8 @@ with st.sidebar:
                         try:
                             raw = fetch_model_item_html(model_course, "Assignment", asg_map[sel_name])
                             model_html_skeleton = html_to_skeleton(raw)
+                            if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
+                                model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
                             st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
                             with st.expander("Preview model HTML skeleton"):
                                 st.code(model_html_skeleton[:4000])
@@ -523,25 +585,32 @@ if courses:
                 original = meta["html"] or ""
                 frozen, mapping, hosts = protect_iframes(original)
 
+                # Trim oversized HTML for prompt resilience
+                if len(frozen) > MAX_INPUT_CHARS:
+                    frozen = frozen[:MAX_INPUT_CHARS] + "\n<!-- truncated for prompt -->"
+
                 # Call OpenAI with chosen models and optional model reference
-                rewritten = openai_rewrite(
-                    user_request=user_request,
-                    html=frozen,
-                    dt_mode=dt_mode,
-                    model_html_skeleton=model_html_skeleton,
-                    model_image_data_url=model_image_data_url,
-                    model_text_id=MODEL_TEXT,
-                    model_vision_id=MODEL_VISION,
-                )
+                try:
+                    rewritten = openai_rewrite(
+                        user_request=user_request,
+                        html=frozen,
+                        dt_mode=dt_mode,
+                        model_html_skeleton=model_html_skeleton,
+                        model_image_data_url=model_image_data_url,
+                        model_text_id=MODEL_TEXT,
+                        model_vision_id=MODEL_VISION,
+                    )
+                except Exception as e:
+                    st.error(f"Rewrite failed for [{meta.get('title') or meta.get('url')}] — {e}")
+                    # Skip this item; continue with others
+                    progress.progress(n / total)
+                    continue
 
                 # Remove any new iframes the model tried to add, then restore originals
                 rewritten_no_new_iframes = strip_new_iframes(rewritten)
-                restored = restore_iframes(rewritten_no_new_iframes, mapping)
+                final_html = restore_iframes(rewritten_no_new_iframes, mapping)
 
-                # Sanitize final HTML (allow inline styles via property allowlist)
-                sanitized = sanitize_html(restored)
-
-                diff_html = html_diff(original, sanitized)
+                diff_html = html_diff(original, final_html)
                 key = f"{meta['kind']}:{meta['id']}"
                 st.session_state["items"].append({
                     "key": key,
@@ -550,7 +619,7 @@ if courses:
                     "module": getattr(module, "name", ""),
                     "item": it,
                     "original": original,
-                    "draft": sanitized,
+                    "draft": final_html,   # no sanitizer: write raw model HTML (with iframes restored)
                     "approved": False,
                 })
                 st.session_state["drafts"][key] = {"diff": diff_html}
