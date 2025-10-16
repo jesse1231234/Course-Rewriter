@@ -6,6 +6,8 @@
 # - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals
 # - Model Reference: Paste HTML (skeletonized), Upload Image (vision), or pick from a Model Course
 # - Auto-pick newest OpenAI models + retries/fallbacks for transient API errors
+# - ETA during dry-run
+# - Approve All / Unapprove All buttons to toggle per-item approvals in bulk
 # - No sanitizer: writes model output directly back to Canvas
 
 import os
@@ -43,10 +45,18 @@ canvas = Canvas(CANVAS_BASE_URL, CANVAS_ADMIN_TOKEN)
 account = canvas.get_account(CANVAS_ACCOUNT_ID)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------------- Helpers ----------------------
+# ---------------------- Small utils ----------------------
 
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+# ---------------------- Canvas helpers ----------------------
 
 def find_course_by_code(account, course_code: str) -> List:
     """Search by course_code; prefer exact code match if available."""
@@ -73,7 +83,14 @@ def fetch_item_html(course, item):
         asg = course.get_assignment(item.content_id)
         return {"kind": "Assignment", "id": asg.id, "title": asg.name, "html": asg.description or ""}
 
-# Freeze/restore existing iframes so their domains remain unchanged
+def apply_update(course, item, new_html: str):
+    if item.type == "Page":
+        course.get_page(item.page_url).edit(wiki_page={"body": new_html})
+    elif item.type == "Assignment":
+        course.get_assignment(item.content_id).edit(assignment={"description": new_html})
+
+# ---------------------- Iframe freeze/restore ----------------------
+
 PLACEHOLDER_FMT = "⟪IFRAME:{i}⟫"
 
 def protect_iframes(html: str):
@@ -105,7 +122,7 @@ def strip_new_iframes(html: str) -> str:
         tag.decompose()
     return str(soup)
 
-# ---- Model reference helpers ----
+# ---------------------- Model-reference helpers ----------------------
 
 def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80) -> str:
     """
@@ -127,13 +144,13 @@ def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80)
                 continue
             if isinstance(v, (list, tuple)):
                 v = " ".join(map(str, v))
-            v = " ".join(str(v).split())[:120]  # compact + limit
+            v = " ".join(str(v).split())[:120]
             parts.append(f'{k}="{v}"')
         return (" " + " ".join(parts)) if parts else ""
 
     headings = {"h1","h2","h3","h4","h5","h6","summary","label"}
 
-    count = [0]  # mutable counter in closure
+    count = [0]
 
     def render(node) -> str:
         if count[0] >= max_nodes:
@@ -147,7 +164,6 @@ def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80)
         start = f"<{node.name}{fmt_attrs(node.attrs)}>"
         inner = []
 
-        # Keep a small amount of direct text for headings/labels/summaries
         if node.name in headings:
             direct_text = []
             for child in node.children:
@@ -157,7 +173,6 @@ def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80)
             if text:
                 inner.append(text[:max_text])
 
-        # Recurse into child tags
         for child in node.children:
             if isinstance(child, Tag):
                 piece = render(child)
@@ -235,7 +250,7 @@ def image_to_data_url(file) -> Tuple[str, str]:
     data_url = f"data:{mime};base64,{b64}"
     return data_url, mime
 
-# ---------------------- Model selection (Auto-pick newest) ----------------------
+# ---------------------- Auto-pick newest model ----------------------
 
 def list_models(client: OpenAI):
     """Return a list of model objects; empty list if listing isn't permitted."""
@@ -293,7 +308,6 @@ def _create_with_retries(
 
     last_err = None
 
-    # try primary
     for attempt in range(max_retries):
         try:
             return _do_call(model)
@@ -303,7 +317,6 @@ def _create_with_retries(
                 break
             time.sleep(base_delay * (2 ** attempt) + random.random() * 0.5)
 
-    # try fallback once (with retries) if provided
     if fallback_model and fallback_model != model:
         for attempt in range(max_retries):
             try:
@@ -363,7 +376,6 @@ def openai_rewrite(
             base_delay=1.0,
         )
     else:
-        # Try multimodal; on failure, fall back to text-only with the text model
         try:
             content_parts = [
                 {"type": "input_text", "text": "\n\n".join(text_blocks[:3])}
@@ -405,19 +417,13 @@ def openai_rewrite(
     except AttributeError:
         return resp.output[0].content[0].text  # fallback
 
-# ---------------------- Diff & Apply ----------------------
+# ---------------------- Diff ----------------------
 
 def html_diff(old: str, new: str) -> str:
     dmp = diff_match_patch()
     d = dmp.diff_main(old or "", new or "")
     dmp.diff_cleanupSemantic(d)
     return dmp.diff_prettyHtml(d)
-
-def apply_update(course, item, new_html: str):
-    if item.type == "Page":
-        course.get_page(item.page_url).edit(wiki_page={"body": new_html})
-    elif item.type == "Assignment":
-        course.get_assignment(item.content_id).edit(assignment={"description": new_html})
 
 # ---------------------- UI ----------------------
 
@@ -579,8 +585,14 @@ if courses:
                 module_items = list_supported_items(course)
 
             progress = st.progress(0.0)
+            eta_box = st.empty()
             total = max(len(module_items), 1)
+            start_time = time.time()
+            recent_durations = []
+            WINDOW = 5
+
             for n, (module, it) in enumerate(module_items, start=1):
+                item_t0 = time.time()
                 meta = fetch_item_html(course, it)
                 original = meta["html"] or ""
                 frozen, mapping, hosts = protect_iframes(original)
@@ -602,8 +614,32 @@ if courses:
                     )
                 except Exception as e:
                     st.error(f"Rewrite failed for [{meta.get('title') or meta.get('url')}] — {e}")
-                    # Skip this item; continue with others
                     progress.progress(n / total)
+                    # still add an entry so user can inspect/apply original if desired
+                    key = f"{meta['kind']}:{meta['id']}"
+                    st.session_state["items"].append({
+                        "key": key,
+                        "title": meta.get("title") or meta.get("url"),
+                        "kind": meta["kind"],
+                        "module": getattr(module, "name", ""),
+                        "item": it,
+                        "original": original,
+                        "draft": original,
+                    })
+                    st.session_state["drafts"][key] = {"diff": html_diff(original, original)}
+                    # ETA update
+                    duration = time.time() - item_t0
+                    recent_durations.append(duration)
+                    if len(recent_durations) > WINDOW:
+                        recent_durations.pop(0)
+                    avg_item = (sum(recent_durations) / len(recent_durations)) if recent_durations else max(0.1, (time.time() - start_time) / n)
+                    remaining = total - n
+                    eta_sec = remaining * avg_item
+                    elapsed = time.time() - start_time
+                    eta_box.info(
+                        f"Processed {n}/{total} items · Elapsed {_format_duration(elapsed)} · "
+                        f"Avg/Item {avg_item:.1f}s · ETA {_format_duration(eta_sec)}"
+                    )
                     continue
 
                 # Remove any new iframes the model tried to add, then restore originals
@@ -619,23 +655,57 @@ if courses:
                     "module": getattr(module, "name", ""),
                     "item": it,
                     "original": original,
-                    "draft": final_html,   # no sanitizer: write raw model HTML (with iframes restored)
-                    "approved": False,
+                    "draft": final_html,
                 })
                 st.session_state["drafts"][key] = {"diff": diff_html}
+
+                # --- update ETA/progress UI ---
+                duration = time.time() - item_t0
+                recent_durations.append(duration)
+                if len(recent_durations) > WINDOW:
+                    recent_durations.pop(0)
+                avg_item = (sum(recent_durations) / len(recent_durations)) if recent_durations else max(0.1, (time.time() - start_time) / n)
+                remaining = total - n
+                eta_sec = remaining * avg_item
+                elapsed = time.time() - start_time
+                eta_box.info(
+                    f"Processed {n}/{total} items · Elapsed {_format_duration(elapsed)} · "
+                    f"Avg/Item {avg_item:.1f}s · ETA {_format_duration(eta_sec)}"
+                )
                 progress.progress(n / total)
+
             st.success(f"Prepared {len(st.session_state['items'])} items.")
 
     items = st.session_state.get("items", [])
     if items:
         st.subheader("3) Review diffs & approve")
-        approve_all = st.checkbox("Approve all")
+
+        # Bulk approval controls
+        col1, col2, col3 = st.columns([1,1,3])
+        with col1:
+            if st.button("Approve All"):
+                for rec in items:
+                    cb_key = f"approve_{rec['key']}"
+                    st.session_state[cb_key] = True
+        with col2:
+            if st.button("Unapprove All"):
+                for rec in items:
+                    cb_key = f"approve_{rec['key']}"
+                    st.session_state[cb_key] = False
+        with col3:
+            # show a quick summary
+            approved_count = sum(1 for rec in items if st.session_state.get(f"approve_{rec['key']}", False))
+            st.write(f"Approved: **{approved_count} / {len(items)}**")
+
+        # Render each item, checkbox state bound to session_state
         for _, rec in enumerate(items):
+            cb_key = f"approve_{rec['key']}"
             with st.expander(f"[{rec['kind']}] {rec['title']} — {rec['module']}"):
                 st.markdown("**Diff (proposed vs original)**  \n_Green = insertions, Red = deletions_", help="Generated by diff-match-patch")
                 st.components.v1.html(st.session_state["drafts"][rec["key"]]["diff"], height=260, scrolling=True)
-                approved = st.checkbox("Approve this item", key=f"approve_{rec['key']}", value=approve_all)
-                rec["approved"] = approved
+                approved = st.checkbox("Approve this item", key=cb_key, value=st.session_state.get(cb_key, False))
+                # Keep dict in sync (not strictly necessary for apply, but good for preview summaries)
+                rec["approved"] = bool(approved)
                 with st.expander("Show HTML (original)"):
                     st.code(rec["original"][:2000])
                 with st.expander("Show HTML (proposed)"):
@@ -646,7 +716,8 @@ if courses:
             applied, failed = 0, 0
             with st.spinner("Applying to Canvas…"):
                 for rec in items:
-                    if not rec["approved"]:
+                    cb_key = f"approve_{rec['key']}"
+                    if not st.session_state.get(cb_key, False):
                         continue
                     try:
                         apply_update(course, rec["item"], rec["draft"])
