@@ -1,6 +1,5 @@
 streamlit
 canvasapi
 openai
-nh3
 beautifulsoup4
 diff-match-patch
