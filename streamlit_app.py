@@ -6,6 +6,7 @@
 # - Allows inline styles safely via nh3 filter_style_properties
 # - DesignTools Mode (Preserve/Enhance/Replace) + free-form rewrite goals
 # - Model Reference: Paste HTML (skeletonized), Upload Image (vision), or pick from a Model Course
+# - NEW: Auto-pick the newest available OpenAI models (with manual override)
 
 import os
 import re
@@ -31,67 +32,15 @@ CANVAS_ACCOUNT_ID = int(SECRETS["CANVAS_ACCOUNT_ID"])
 CANVAS_ADMIN_TOKEN = SECRETS["CANVAS_ADMIN_TOKEN"]
 OPENAI_API_KEY = SECRETS["OPENAI_API_KEY"]
 
+# Defaults if auto-pick fails or listing isn't permitted
+DEFAULT_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5")   # fallback to 5 → 4.1 below if unavailable
+DEFAULT_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
+
 st.set_page_config(page_title="Canvas Course-wide HTML Rewrite (Test)", layout="wide")
 
 canvas = Canvas(CANVAS_BASE_URL, CANVAS_ADMIN_TOKEN)
 account = canvas.get_account(CANVAS_ACCOUNT_ID)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ---------------------- Policy / Sanitizer ----------------------
-
-ALLOWED_TAGS = [
-    "a", "abbr", "b", "blockquote", "br", "code", "div", "em",
-    "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img",
-    "li", "ol", "p", "pre", "s", "section", "small", "span", "strong",
-    "sub", "sup", "table", "thead", "tbody", "tfoot", "tr", "th", "td",
-    "u", "ul", "details", "summary", "iframe"
-]
-
-ATTRIBUTES = {
-    "*": ["id", "class", "style", "title", "role", "aria-*", "data-*"],
-    "a": ["href", "target", "rel"],
-    "img": ["src", "alt", "width", "height"],
-    "iframe": ["src", "width", "height", "allow", "allowfullscreen"],
-    "th": ["scope"],
-    "td": ["colspan", "rowspan"],
-}
-
-# Conservative but useful set of CSS properties for inline styles
-ALLOWED_CSS_PROPERTIES = {
-    # layout
-    "display", "visibility", "float", "clear", "overflow", "overflow-x", "overflow-y",
-    "position", "top", "right", "bottom", "left", "z-index",
-    "box-sizing",
-    # spacing & size
-    "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
-    "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
-    "width", "min-width", "max-width", "height", "min-height", "max-height",
-    # borders & backgrounds
-    "border", "border-top", "border-right", "border-bottom", "border-left",
-    "border-width", "border-style", "border-color", "border-radius",
-    "background", "background-color", "background-image", "background-position",
-    "background-size", "background-repeat",
-    # text & fonts
-    "color", "font", "font-family", "font-size", "font-weight", "font-style",
-    "font-variant", "line-height", "letter-spacing", "text-align",
-    "text-decoration", "text-transform", "white-space", "word-break",
-    # flex & grid (common for themes)
-    "flex", "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
-    "justify-content", "align-items", "align-content", "gap", "row-gap", "column-gap",
-    "grid", "grid-template", "grid-template-columns", "grid-template-rows", "grid-column", "grid-row",
-    # effects
-    "opacity", "box-shadow",
-}
-
-def sanitize_html(html: str) -> str:
-    """Sanitize HTML, allowing inline styles for a curated set of properties."""
-    return nh3.clean(
-        html,
-        tags=set(ALLOWED_TAGS),
-        attributes={k: set(v) for k, v in ATTRIBUTES.items()},
-        filter_style_properties=set(ALLOWED_CSS_PROPERTIES),
-        link_rel=None,  # don't force rel=... unless you want to enforce noopener here
-    )
 
 # ---------------------- Helpers ----------------------
 
@@ -189,9 +138,7 @@ def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80)
         if count[0] >= max_nodes:
             return ""
         if isinstance(node, NavigableString):
-            # We only keep text when the *parent* is a heading-like tag; handled in parent.
             return ""
-
         if not isinstance(node, Tag):
             return ""
 
@@ -290,19 +237,38 @@ def image_to_data_url(file) -> Tuple[str, str]:
     data_url = f"data:{mime};base64,{b64}"
     return data_url, mime
 
-# ---------------------- OpenAI ----------------------
+# ---------------------- Model selection (Auto-pick newest) ----------------------
+
+def list_models(client: OpenAI):
+    """Return a list of model objects; empty list if listing isn't permitted."""
+    try:
+        res = client.models.list()
+        data = getattr(res, "data", res)
+        return list(data)
+    except Exception:
+        return []
+
+def latest_model_id(client: OpenAI, pattern: str, default_id: str) -> str:
+    """
+    Pick the newest model (by created timestamp) whose id matches `pattern` (regex).
+    Fallback to default_id if none match or listing isn't allowed.
+    """
+    models = list_models(client)
+    try:
+        matches = [m for m in models if re.search(pattern, m.id)]
+        if not matches:
+            return default_id
+        matches.sort(key=lambda m: getattr(m, "created", 0), reverse=True)
+        return matches[0].id
+    except Exception:
+        return default_id
+
+# ---------------------- OpenAI Rewrite ----------------------
 
 SYSTEM_PROMPT = (
     "You are an expert Canvas HTML editor. Preserve links, anchors/IDs, classes, and data-* attributes. "
     "Placeholders like ⟪IFRAME:n⟫ represent protected iframes—do not add, remove, or reorder them. "
     "Follow the policy. Return only HTML, no explanations."
-    "Reformat the HTML using DesignPLUS styling."
-    "Do not change the content of the page, only the design."
-    "Use Colorado State University branding colors."
-    "Use Circle Left 1 theme only"
-    "put all iframes within accordions"
-    "The focus is on styling, structure, and accessibility — not changing the content."
-    "apply consistent design choices across all pages"
 )
 
 DT_MODES = ["Preserve", "Enhance", "Replace"]
@@ -313,6 +279,8 @@ def openai_rewrite(
     dt_mode: str,
     model_html_skeleton: Optional[str] = None,
     model_image_data_url: Optional[str] = None,
+    model_text_id: str = DEFAULT_TEXT_MODEL,
+    model_vision_id: str = DEFAULT_VISION_MODEL,
 ) -> str:
     """
     Call OpenAI Responses API to rewrite the HTML.
@@ -337,44 +305,54 @@ def openai_rewrite(
     if model_html_skeleton:
         text_blocks.insert(3, "Model HTML skeleton (follow structure/classes, not text):\n" + model_html_skeleton)
 
+    # Helper to detect "model not found" and retry with a fallback once
+    def _create_with_fallback(primary_model: str, payload_input, fallback_model: str):
+        try:
+            return openai_client.responses.create(
+                model=primary_model,
+                input=payload_input,
+                temperature=0.2,
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "model" in msg and ("not found" in msg or "does not exist" in msg or "unknown" in msg):
+                return openai_client.responses.create(
+                    model=fallback_model,
+                    input=payload_input,
+                    temperature=0.2,
+                )
+            raise
+
     if not model_image_data_url:
         prompt = "\n\n".join(text_blocks)
-        resp = openai_client.responses.create(
-            model="gpt-4.1",
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
+        payload = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        resp = _create_with_fallback(primary_model=model_text_id, payload_input=payload, fallback_model="gpt-4.1")
     else:
-        # Try multimodal; on failure, fall back to text-only
+        # Try multimodal; on failure, fall back to text-only with the text model
         try:
-            content_parts = []
-            content_parts.append({"type": "input_text", "text": "\n\n".join(text_blocks[:3])})
+            content_parts = [
+                {"type": "input_text", "text": "\n\n".join(text_blocks[:3])}
+            ]
             if model_html_skeleton:
                 content_parts.append({"type": "input_text", "text": text_blocks[3]})
             content_parts.append({"type": "input_image", "image_url": {"url": model_image_data_url}})
             content_parts.append({"type": "input_text", "text": "\n".join(text_blocks[-2:])})
 
-            resp = openai_client.responses.create(
-                model="gpt-4o",  # vision-capable model
-                input=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": content_parts},
-                ],
-                temperature=0.2,
-            )
+            payload = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": content_parts},
+            ]
+            resp = _create_with_fallback(primary_model=model_vision_id, payload_input=payload, fallback_model="gpt-4o")
         except Exception:
             prompt = "\n\n".join(text_blocks) + "\n\n(Note: image reference unavailable; proceed using textual model description if any.)"
-            resp = openai_client.responses.create(
-                model="gpt-4.1",
-                input=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
+            payload = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+            resp = _create_with_fallback(primary_model=model_text_id, payload_input=payload, fallback_model="gpt-4.1")
 
     try:
         return resp.output_text  # newer SDKs
@@ -409,6 +387,20 @@ with st.sidebar:
         height=160,
         help="Describe exactly what to change across the course."
     )
+
+    st.markdown("---")
+    st.subheader("Model")
+    mode = st.radio("Selection", ["Auto (latest)", "Manual"], horizontal=True)
+    if mode == "Auto (latest)":
+        # Prefer newest gpt-5 for text; fallback to gpt-4.1 / gpt-4o
+        MODEL_TEXT = latest_model_id(openai_client, r"^(gpt-5|gpt-4\.1|gpt-4o|o\d)", DEFAULT_TEXT_MODEL)
+        # Prefer newest gpt-5 or gpt-4o for vision (most orgs have 4o for vision)
+        MODEL_VISION = latest_model_id(openai_client, r"^(gpt-5|gpt-4o|gpt-4\.1|o\d)", DEFAULT_VISION_MODEL)
+    else:
+        MODEL_TEXT = st.text_input("Text model id", value=DEFAULT_TEXT_MODEL)
+        MODEL_VISION = st.text_input("Vision model id", value=DEFAULT_VISION_MODEL)
+    st.caption(f"Using text model: {MODEL_TEXT}")
+    st.caption(f"Using vision model: {MODEL_VISION}")
 
     st.markdown("---")
     st.subheader("Model Reference (optional)")
@@ -531,13 +523,15 @@ if courses:
                 original = meta["html"] or ""
                 frozen, mapping, hosts = protect_iframes(original)
 
-                # Call OpenAI with optional model reference
+                # Call OpenAI with chosen models and optional model reference
                 rewritten = openai_rewrite(
                     user_request=user_request,
                     html=frozen,
                     dt_mode=dt_mode,
                     model_html_skeleton=model_html_skeleton,
                     model_image_data_url=model_image_data_url,
+                    model_text_id=MODEL_TEXT,
+                    model_vision_id=MODEL_VISION,
                 )
 
                 # Remove any new iframes the model tried to add, then restore originals
